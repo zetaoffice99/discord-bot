@@ -238,33 +238,53 @@ async function sendEmail(userId, userData) {
     refresh_token: userData.googleRefreshToken,
   });
 
-  // Gmail client
   const gmail = google.gmail({
     version: "v1",
     auth: oauth2Client,
   });
 
-  // Build email
-  const emailLines = [
-    `From: ${userData.googleEmail}`,
-    `To: ${recipient}`,
-    `Subject: ${subject || "Message via Discord Bot"}`,
-    "MIME-Version: 1.0",
-    "Content-Type: text/html; charset=UTF-8",
-    "",
-    (body || "").replace(/\n/g, "<br>"),
-  ];
+  const boundary = "boundary_" + Date.now().toString(36);
+  let message = "";
 
-  const email = emailLines.join("\r\n");
+  message += `From: ${userData.googleEmail}\r\n`;
+  message += `To: ${recipient}\r\n`;
+  message += `Subject: ${subject || "Message via Discord Bot"}\r\n`;
+  message += `MIME-Version: 1.0\r\n`;
 
-  // Base64URL encode
-  const encodedMessage = Buffer.from(email)
+  if (session.attachments && session.attachments.length > 0) {
+    // ── Email with attachments (multipart) ──────────────────────────────────
+    message += `Content-Type: multipart/mixed; boundary="${boundary}"\r\n\r\n`;
+
+    // Body part
+    message += `--${boundary}\r\n`;
+    message += `Content-Type: text/html; charset=UTF-8\r\n\r\n`;
+    message += `${(body || "").replace(/\n/g, "<br>")}\r\n\r\n`;
+
+    // Attachment parts
+    for (const file of session.attachments) {
+      const base64Content = file.content.toString("base64");
+      message += `--${boundary}\r\n`;
+      message += `Content-Type: ${file.contentType || "application/octet-stream"}; name="${file.filename}"\r\n`;
+      message += `Content-Disposition: attachment; filename="${file.filename}"\r\n`;
+      message += `Content-Transfer-Encoding: base64\r\n\r\n`;
+      // Base64 split into 76-char lines (MIME standard)
+      message += base64Content.replace(/(.{76})/g, "$1\r\n") + "\r\n\r\n";
+    }
+
+    message += `--${boundary}--`;
+  } else {
+    // ── Plain email (no attachments) ────────────────────────────────────────
+    message += `Content-Type: text/html; charset=UTF-8\r\n\r\n`;
+    message += `${(body || "").replace(/\n/g, "<br>")}`;
+  }
+
+  // Base64URL encode the whole message
+  const encodedMessage = Buffer.from(message)
     .toString("base64")
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=+$/, "");
 
-  // Send email
   const result = await gmail.users.messages.send({
     userId: "me",
     requestBody: {
@@ -396,14 +416,24 @@ function notSetupEmbed(dashboardUrl) {
 
 // ─── Attachment Downloader ────────────────────────────────────────────────────
 
-async function downloadAttachment(url, filename) {
+// ─── Updated Attachment Downloader (with content-type) ────────────────────────
+
+async function downloadAttachment(url, filename, contentType) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     https.get(url, (res) => {
+      if (res.statusCode !== 200) {
+        reject(new Error(`Failed to download attachment: HTTP ${res.statusCode}`));
+        return;
+      }
       res.on('data', chunk => chunks.push(chunk));
-      res.on('end', () => resolve({ filename, content: Buffer.concat(chunks) }));
+      res.on('end', () => resolve({
+        filename,
+        content: Buffer.concat(chunks),
+        contentType: contentType || 'application/octet-stream',
+      }));
       res.on('error', reject);
-    });
+    }).on('error', reject);
   });
 }
 
@@ -484,7 +514,7 @@ client.on('messageCreate', async (message) => {
           await message.reply(`⚠️ **${attachment.name}** is too large (max 8MB).`);
           continue;
         }
-        const file = await downloadAttachment(attachment.url, attachment.name);
+      const file = await downloadAttachment(attachment.url, attachment.name, attachment.contentType);  
         session.attachments.push(file);
         await message.react('📎');
       } catch (err) {
